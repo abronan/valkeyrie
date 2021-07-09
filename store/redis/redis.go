@@ -35,6 +35,11 @@ func Register() {
 // New creates a new Redis client given a list
 // of endpoints and optional tls config
 func New(endpoints []string, options *store.Config) (store.Store, error) {
+	return NewWithCodec(endpoints, options, nil)
+}
+
+// NewWithCodec creates a new Redis client with codec config
+func NewWithCodec(endpoints []string, options *store.Config, codec Codec) (store.Store, error) {
 	if len(endpoints) > 1 {
 		return nil, ErrMultipleEndpointsUnsupported
 	}
@@ -43,14 +48,18 @@ func New(endpoints []string, options *store.Config) (store.Store, error) {
 	}
 
 	var password string
+	var db int
 	if options != nil && options.Password != "" {
 		password = options.Password
 	}
+	if options != nil && options.DB != 0 {
+		db = options.DB
+	}
 
-	return newRedis(endpoints, password, &RawCodec{})
+	return newRedis(endpoints, password, db, codec)
 }
 
-func newRedis(endpoints []string, password string, codec Codec) (*Redis, error) {
+func newRedis(endpoints []string, password string, db int, codec Codec) (*Redis, error) {
 	// TODO: use *redis.ClusterClient if we support multiple endpoints
 	client := redis.NewClient(&redis.Options{
 		Addr:         endpoints[0],
@@ -58,6 +67,7 @@ func newRedis(endpoints []string, password string, codec Codec) (*Redis, error) 
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		Password:     password,
+		DB:           db,
 	})
 
 	// Listen to Keyspace events
@@ -72,6 +82,7 @@ func newRedis(endpoints []string, password string, codec Codec) (*Redis, error) 
 		client: client,
 		script: redis.NewScript(luaScript()),
 		codec:  c,
+		db:     db,
 	}, nil
 }
 
@@ -80,6 +91,7 @@ type Redis struct {
 	client *redis.Client
 	script *redis.Script
 	codec  Codec
+	db     int
 }
 
 const (
@@ -166,7 +178,7 @@ func (r *Redis) Watch(key string, stopCh <-chan struct{}, opts *store.ReadOption
 		}
 	})
 
-	sub, err := newSubscribe(r.client, regexWatch(nKey, false))
+	sub, err := newSubscribe(r.client, regexWatch(r.db, nKey, false))
 	if err != nil {
 		return nil, err
 	}
@@ -183,14 +195,14 @@ func (r *Redis) Watch(key string, stopCh <-chan struct{}, opts *store.ReadOption
 	return watchCh, nil
 }
 
-func regexWatch(key string, withChildren bool) string {
+func regexWatch(db int, key string, withChildren bool) string {
 	var regex string
 	if withChildren {
-		regex = fmt.Sprintf("__keyspace*:%s*", key)
-		// for all database and keys with $key prefix
+		// for specified database and keys with $key prefix
+		regex = fmt.Sprintf("__keyspace@%d__:%s*", db, key)
 	} else {
-		regex = fmt.Sprintf("__keyspace*:%s", key)
-		// for all database and keys with $key
+		// for specified database and keys with $key
+		regex = fmt.Sprintf("__keyspace@%d__:%s", db, key)
 	}
 	return regex
 }
@@ -205,10 +217,14 @@ func watchLoop(msgCh chan *redis.Message, _ <-chan struct{}, get getter, push pu
 
 	// deliver the original data before we setup any events
 	pair, err := get()
-	if err != nil {
+	if err != nil && err != store.ErrKeyNotFound {
 		return err
 	}
-	push(pair)
+	if err == store.ErrKeyNotFound {
+		push(&store.KVPair{})
+	} else {
+		push(pair)
+	}
 
 	for m := range msgCh {
 		// retrieve and send back
@@ -218,7 +234,7 @@ func watchLoop(msgCh chan *redis.Message, _ <-chan struct{}, get getter, push pu
 		}
 
 		// in case of watching a key that has been expired or deleted return and empty KV
-		if err == store.ErrKeyNotFound && (m.Payload == "expire" || m.Payload == "del") {
+		if err == store.ErrKeyNotFound && (m.Payload == "expired" || m.Payload == "del") {
 			push(&store.KVPair{})
 		} else {
 			push(pair)
@@ -297,7 +313,7 @@ func (r *Redis) WatchTree(directory string, stopCh <-chan struct{}, opts *store.
 		watchCh <- v.([]*store.KVPair)
 	})
 
-	sub, err := newSubscribe(r.client, regexWatch(nKey, true))
+	sub, err := newSubscribe(r.client, regexWatch(r.db, nKey, true))
 	if err != nil {
 		return nil, err
 	}
